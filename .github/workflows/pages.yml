@@ -29,7 +29,7 @@ jobs:
 
       - name: Run activity detection script
         run: |
-          python app.py --excel "data/time_12.25 inch HS.xlsx" --outdir "site"
+          python app.py --excel "time_12.25 inch HS.xlsx" --outdir "site"
 
       - name: Prepare site for Pages
         run: |
