@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Combined Activity Detection (Reaming + Backreaming, single blue color)
-Author: Rio Gunawan
+Generates OFFLINE interactive HTML (Plotly JS inlined), PNGs, and CSV.
 
 Rules:
   Pump ON            : TFLO > TFLO_ON_THRESHOLD (default 10 gpm)
@@ -10,41 +10,36 @@ Rules:
       (CDEPTH - DBTM) >= BACK_DELTA_FT
   Minimum Duration   : MIN_ACTIVITY_SECONDS (default 10 s)
 
-Outputs (written next to the input Excel by default):
+Outputs (written to --outdir, default ./site):
   - <base>_segments_blue.csv
-      Columns: t_start, t_end, duration_sec, excursion_ft
   - <base>_overview_blue.png
-      5-panel overview (TFLO/SPPA/ECD/ROP5/BPOS) with blue strips over BPOS & TFLO
   - <base>_bpos_strip_blue.png
-      Compact BPOS strip with blue shading
-  - <base>_interactive_blue.html
-      Interactive Plotly chart (via CDN), with range slider & selector
+  - <base>_interactive_blue_offline.html  (self-contained)
+  - index.html  (copy of offline HTML for convenience)
 
 Usage:
-  python activity_detection_blue.py --excel "time_12.25 inch HS.xlsx"
+  python app.py --excel "time_12.25 inch HS.xlsx" --outdir "site"
 
-Optional:
-  python activity_detection_blue.py --excel "file.xlsx" --outdir "./results" \
-    --tflo 10 --minsec 10 --ream 3 --back 20 --alpha 0.22 --color "#1f77b4"
+Optional flags:
+  --tflo 10 --minsec 10 --ream 3 --back 20 --color "#1f77b4" --alpha 0.22
 """
 
-import json
 import argparse
 from pathlib import Path
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from matplotlib.ticker import MaxNLocator
 import matplotlib.dates as mdates
-
+from matplotlib.ticker import MaxNLocator
+import plotly.graph_objects as go
 
 # ----------------------------
-# Defaults (you can override via CLI flags)
+# Defaults (override via CLI)
 # ----------------------------
-DEFAULT_TFLO_ON_THRESHOLD     = 10.0   # gpm (Pump ON)
-DEFAULT_MIN_ACTIVITY_SECONDS  = 10     # s   (min continuous segment)
-DEFAULT_REAM_DELTA_FT         = 3.0    # ft  (DBTM - CDEPTH >= +3 ft)
-DEFAULT_BACK_DELTA_FT         = 20.0   # ft  (CDEPTH - DBTM >= 20 ft)
+DEFAULT_TFLO_ON_THRESHOLD     = 10.0   # gpm
+DEFAULT_MIN_ACTIVITY_SECONDS  = 10     # s
+DEFAULT_REAM_DELTA_FT         = 3.0    # ft
+DEFAULT_BACK_DELTA_FT         = 20.0   # ft
 SENTINEL                      = -999.25
 STRIP_COLOR_DEFAULT           = "#1f77b4"  # single blue
 STRIP_ALPHA_DEFAULT           = 0.22
@@ -58,7 +53,7 @@ def load_and_clean_excel(path: Path) -> pd.DataFrame:
     df = pd.read_excel(path, engine="openpyxl")
     df.columns = [str(c).strip() for c in df.columns]
 
-    # Build timestamp from Date or Time or first column
+    # Timestamp from Date or Time or first column
     if "Date" in df.columns:
         ts = pd.to_datetime(df["Date"], errors="coerce")
     elif "Time" in df.columns:
@@ -67,7 +62,7 @@ def load_and_clean_excel(path: Path) -> pd.DataFrame:
         ts = pd.to_datetime(df.iloc[:, 0], errors="coerce")
     df["timestamp"] = ts
 
-    # Replace sentinel -> NaN and coerce numerics for needed channels
+    # Replace sentinel -> NaN and coerce numerics
     df = df.replace(SENTINEL, np.nan)
     for c in ["TFLO", "SPPA", "ECD", "ROP5", "DBTM", "BPOS", "TVDE", "CDEPTH"]:
         if c in df.columns:
@@ -90,9 +85,9 @@ def detect_activity_segments(
 ) -> pd.DataFrame:
     """
     Detect contiguous combined activity segments given Pump ON and excursion rules.
-    Returns a DataFrame with columns: t_start, t_end, duration_sec, excursion_ft.
+    Returns columns: t_start, t_end, duration_sec, excursion_ft.
     """
-    # Required columns
+    # Required channels
     for col in ["TFLO", "DBTM", "CDEPTH"]:
         if col not in df.columns:
             raise ValueError(f"Missing required column: {col}")
@@ -111,7 +106,7 @@ def detect_activity_segments(
         starts = dm[dm == 1].index.tolist()
         ends   = dm[dm == -1].index.tolist()
 
-        # Edge handling (series starts/ends in True)
+        # Edge handling
         if mask.iloc[0]:
             starts = [mask.index[0]] + starts
         if mask.iloc[-1]:
@@ -123,9 +118,8 @@ def detect_activity_segments(
             dur_sec = (t1 - t0).total_seconds()
 
             if dur_sec >= min_sec:
-                # |delta| (absolute excursion vs CDEPTH) max inside segment
                 dsub = (df["DBTM"] - df["CDEPTH"]).iloc[s:e+1].values
-                excursion_ft = float(np.nanmax(np.maximum(dsub, -dsub)))
+                excursion_ft = float(np.nanmax(np.maximum(dsub, -dsub)))  # max |delta|
                 segments.append({
                     "t_start": t0,
                     "t_end"  : t1,
@@ -133,19 +127,15 @@ def detect_activity_segments(
                     "excursion_ft": excursion_ft,
                 })
 
-    seg_df = pd.DataFrame(segments).sort_values("t_start").reset_index(drop=True)
-    return seg_df
+    return pd.DataFrame(segments).sort_values("t_start").reset_index(drop=True)
 
 
 # ----------------------------
-# Plots — Matplotlib
+# Matplotlib plots
 # ----------------------------
 def plot_overview_with_blue_strips(df: pd.DataFrame, seg_df: pd.DataFrame,
                                    out_png: Path, color: str, alpha: float) -> Path:
-    """
-    5-panel overview (TFLO, SPPA, ECD, ROP5, BPOS) with blue activity strips overlay
-    on BPOS and TFLO panels. X-axis shows date+time.
-    """
+    """5‑panel overview (TFLO, SPPA, ECD, ROP5, BPOS) with blue strips on BPOS & TFLO."""
     plt.style.use("seaborn-v0_8")
     fig, axs = plt.subplots(5, 1, figsize=(14, 12), sharex=True)
 
@@ -163,7 +153,6 @@ def plot_overview_with_blue_strips(df: pd.DataFrame, seg_df: pd.DataFrame,
     panel(axs[4], "BPOS", "black",  "BPOS (ft)")
     axs[-1].set_xlabel("Date & Time")
 
-    # Blue shading on BPOS + TFLO
     if not seg_df.empty:
         ymax = float(df["BPOS"].max(skipna=True)) if "BPOS" in df.columns else np.nan
         for _, s in seg_df.iterrows():
@@ -176,13 +165,11 @@ def plot_overview_with_blue_strips(df: pd.DataFrame, seg_df: pd.DataFrame,
                             f"{int(s['duration_sec'])}s\n±{s['excursion_ft']:.0f} ft",
                             fontsize=7, color=color, rotation=90, va="top")
 
-    # Date & time formatting
     axs[-1].xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d %H:%M:%S"))
     axs[-1].xaxis.set_major_locator(mdates.AutoDateLocator())
     plt.setp(axs[-1].get_xticklabels(), rotation=30, ha="right")
 
-    fig.suptitle("Activity (Ream+Backream, TFLO>10) — Blue strips on BPOS/TFLO",
-                 y=0.995, fontsize=13)
+    fig.suptitle("Activity (Ream+Backream, TFLO>10) — Blue strips on BPOS/TFLO", y=0.995, fontsize=13)
     fig.tight_layout(rect=[0, 0, 1, 0.98])
 
     fig.savefig(out_png, dpi=150)
@@ -221,84 +208,48 @@ def plot_bpos_strip_blue(df: pd.DataFrame, seg_df: pd.DataFrame,
 
 
 # ----------------------------
-# Interactive HTML — Plotly via CDN (no python-plotly dependency)
+# Plotly OFFLINE HTML (self-contained)
 # ----------------------------
-def export_plotly_html(df: pd.DataFrame, seg_df: pd.DataFrame,
-                       out_html: Path, color: str, alpha: float) -> Path:
-    """
-    Create an interactive HTML using Plotly via CDN (no local plotly package needed).
-    Includes range slider & selector. Single BPOS trace + blue strips.
-    """
-    x = df["timestamp"].dt.strftime("%Y-%m-%dT%H:%M:%S").tolist()
-    y = df["BPOS"].fillna(np.nan).tolist()
+def export_plotly_html_offline(df: pd.DataFrame, seg_df: pd.DataFrame,
+                               out_html: Path, color: str, alpha: float) -> Path:
+    """Create a fully self-contained HTML (Plotly JS inlined) for offline use."""
+    fig = go.Figure()
 
-    shapes_js = []
+    # BPOS trace
+    fig.add_trace(go.Scatter(
+        x=df["timestamp"], y=df["BPOS"],
+        mode="lines", name="BPOS",
+        line=dict(color="black", width=1),
+        hovertemplate="%{x}<br>BPOS: %{y:.2f} ft<extra></extra>"
+    ))
+
+    # Blue strips as shapes
     for _, s in seg_df.iterrows():
-        shapes_js.append({
-            "type": "rect",
-            "xref": "x", "yref": "paper",
-            "x0": pd.to_datetime(s["t_start"]).strftime("%Y-%m-%dT%H:%M:%S"),
-            "x1": pd.to_datetime(s["t_end"]).strftime("%Y-%m-%dT%H:%M:%S"),
-            "y0": 0, "y1": 1,
-            "fillcolor": color,
-            "opacity": alpha,
-            "line": {"width": 0},
-        })
+        fig.add_shape(
+            type="rect", xref="x", yref="paper",
+            x0=pd.to_datetime(s["t_start"]), x1=pd.to_datetime(s["t_end"]),
+            y0=0, y1=1, fillcolor=color, opacity=alpha, line=dict(width=0)
+        )
 
-    html = f"""<!DOCTYPE html>
-<html lang='en'>
-<head>
-<meta charset='utf-8'/>
-<meta name='viewport' content='width=device-width, initial-scale=1'>
-<title>BPOS Activity (Blue Strips)</title>
-<script src.plot.ly/plotly-2.32.0.min.js</script>
-<style>
-  body {{ font-family: Arial, sans-serif; }}
-  #chart {{ width: 100%; height: 80vh; }}
-  .note {{ font-size: 12px; color: #555; margin: 8px 0 0 6px; }}
-</style>
-</head>
-<body>
-<div id='chart'></div>
-<div class='note'>Zoom with mouse drag, pan with right-click/drag, use range slider & selector below. Double-click to reset.</div>
-<script>
-var x = {json.dumps(x)};
-var y = {json.dumps(y)};
-var data = [{{
-  x: x,
-  y: y,
-  mode: 'lines',
-  name: 'BPOS',
-  line: {{color:'black', width:1}},
-  hovertemplate: '%{{x}}<br>BPOS: %{{y:.2f}} ft'+'<extra></extra>'
-}}];
+    fig.update_layout(
+        title="BPOS with Activity Strips (Ream+Backream) — Blue (Offline)",
+        xaxis=dict(
+            title="Date & Time",
+            type="date",
+            rangeslider=dict(visible=True),
+            rangeselector=dict(buttons=[
+                dict(count=1, label="1h", step="hour", stepmode="backward"),
+                dict(count=6, label="6h", step="hour", stepmode="backward"),
+                dict(count=1, label="1d", step="day", stepmode="backward"),
+                dict(step="all"),
+            ]),
+        ),
+        yaxis=dict(title="BPOS (ft)", fixedrange=False),
+        margin=dict(l=60, r=20, t=50, b=60),
+    )
 
-var layout = {{
-  title: 'BPOS with Activity Strips (Ream+Backream) — Blue',
-  xaxis: {{
-    title: 'Date & Time',
-    type: 'date',
-    rangeslider: {{visible: true}},
-    rangeselector: {{
-      buttons: [
-        {{count: 1, label: '1h', step: 'hour', stepmode: 'backward'}},
-        {{count: 6, label: '6h', step: 'hour', stepmode: 'backward'}},
-        {{count: 1, label: '1d', step: 'day', stepmode: 'backward'}},
-        {{step: 'all'}}
-      ]
-    }}
-  }},
-  yaxis: {{title: 'BPOS (ft)', fixedrange: false}},
-  shapes: {json.dumps(shapes_js)},
-  margin: {{l: 60, r: 20, t: 50, b: 60}},
-}};
-
-Plotly.newPlot('chart', data, layout, {{responsive: true}});
-</script>
-</body>
-</html>"""
-
-    out_html.write_text(html, encoding="utf-8")
+    # Inline Plotly JS
+    fig.write_html(str(out_html), include_plotlyjs="inline", full_html=True)
     return out_html
 
 
@@ -307,10 +258,10 @@ Plotly.newPlot('chart', data, layout, {{responsive: true}});
 # ----------------------------
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Combined Ream+Backream detection (blue strips) on BPOS."
+        description="Combined Ream+Backream detection (blue strips) on BPOS, OFFLINE HTML."
     )
     p.add_argument("--excel", required=True, help="Path to the Excel historian (.xlsx)")
-    p.add_argument("--outdir", default="", help="Output directory (default: alongside Excel)")
+    p.add_argument("--outdir", default="site", help="Output directory (default: ./site)")
     p.add_argument("--tflo", type=float, default=DEFAULT_TFLO_ON_THRESHOLD, help="Pump ON threshold (gpm)")
     p.add_argument("--minsec", type=int, default=DEFAULT_MIN_ACTIVITY_SECONDS, help="Minimum segment duration (sec)")
     p.add_argument("--ream", type=float, default=DEFAULT_REAM_DELTA_FT, help="Ream excursion threshold (ft)")
@@ -327,9 +278,10 @@ def main():
     if not excel_path.exists():
         raise FileNotFoundError(f"Excel not found: {excel_path}")
 
-    # Output directory & base names
-    outdir = Path(args.outdir) if args.outdir else excel_path.parent
+    # Output dir
+    outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
+
     base = excel_path.stem
 
     # Load & process
@@ -355,10 +307,16 @@ def main():
     print(f"[PNG] Saved overview  → {overview_png}")
     print(f"[PNG] Saved BPOS strip → {bpos_png}")
 
-    # Interactive HTML
-    html_path = outdir / f"{base}_interactive_blue.html"
-    export_plotly_html(df, seg_df, html_path, args.color, args.alpha)
-    print(f"[HTML] Saved interactive chart → {html_path}")
+    # OFFLINE interactive HTML
+    html_offline = outdir / f"{base}_interactive_blue_offline.html"
+    export_plotly_html_offline(df, seg_df, html_offline, args.color, args.alpha)
+    print(f"[HTML] Saved OFFLINE interactive chart → {html_offline}")
+
+    # Make index.html (landing file)
+    index_html = outdir / "index.html"
+    index_html.write_text(html_offline.read_text(encoding="utf-8"), encoding="utf-8")
+    print(f"[HTML] Copied offline chart → {index_html}")
+
     print("Done.")
 
 
