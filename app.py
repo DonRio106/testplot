@@ -21,7 +21,7 @@ Usage:
   python app.py --excel "time_12.25 inch HS.xlsx" --outdir "site"
 
 Optional flags:
-  --tflo 10 --minsec 10 --ream 3 --back 20 --color "#1f77b4" --alpha 0.22
+  --tflo 10 --minsec 10 --ream 3 --back 3 --color "#1f77b4" --alpha 0.22
 """
 
 import argparse
@@ -39,7 +39,7 @@ import plotly.graph_objects as go
 DEFAULT_TFLO_ON_THRESHOLD     = 10.0   # gpm
 DEFAULT_MIN_ACTIVITY_SECONDS  = 10     # s
 DEFAULT_REAM_DELTA_FT         = 3.0    # ft
-DEFAULT_BACK_DELTA_FT         = 20.0   # ft
+DEFAULT_BACK_DELTA_FT         = 3.0   # ft
 SENTINEL                      = -999.25
 STRIP_COLOR_DEFAULT           = "#1f77b4"  # single blue
 STRIP_ALPHA_DEFAULT           = 0.22
@@ -322,3 +322,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
