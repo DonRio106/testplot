@@ -3,14 +3,16 @@
 Combined Activity Detection (Reaming + Backreaming, single blue color)
 Generates OFFLINE interactive HTML (Plotly JS inlined), PNGs, and CSV.
 
-This is a revised version with:
- - Fixes to segment edge handling (start/end indices and duration calculation).
- - Robust handling of CSV or Excel input.
- - Better handling when required columns are missing.
- - Logging instead of print for easier debugging.
- - Minor defensive checks in plotting.
- - Type hints for key functions.
+This script was updated to match the requested subplot order:
+ - Row 1: BPOS (primary Y) and DBTM (also primary Y, overlayed)
+ - Row 2: TFLO (primary Y) and SPPA (secondary Y)
+ - Row 3: RPM (primary Y) and TQA (secondary Y)
 
+Y-axes are interactive (fixedrange=False, autorange=True) so you can dynamically adjust/zoom Y scale in the Plotly offline HTML.
+Fallback column names are supported:
+ - RPM <- ["RPM", "TVDE"]
+ - TQA <- ["TQA", "TRQ"]
+DBTM is plotted only on Row 1 (the main BPOS row) as requested.
 Usage:
   python app.py --excel "time_12.25 inch HS.xlsx" --outdir "site"
 """
@@ -72,7 +74,7 @@ def load_and_clean(path: Path) -> pd.DataFrame:
 
     # Replace sentinel -> NaN and coerce numerics for expected columns
     df = df.replace(SENTINEL, np.nan)
-    for c in ["TFLO", "SPPA", "ECD", "ROP5", "DBTM", "BPOS", "TVDE", "CDEPTH", "RPM", "TQA"]:
+    for c in ["TFLO", "SPPA", "ECD", "ROP5", "DBTM", "BPOS", "TVDE", "CDEPTH", "RPM", "TQA", "TRQ"]:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
 
@@ -91,16 +93,8 @@ def detect_activity_segments(
     """
     Detect contiguous combined activity segments given Pump ON and excursion rules.
 
-    Corrected segmentation:
-      - Find indices where mask is True.
-      - Group contiguous indices into segments.
-      - Use the first and last True timestamps for t_start and t_end.
-      - Compute duration as t_end - t_start (seconds).
-      - Compute excursion as max(|DBTM - CDEPTH|) within the True range.
-
     Returns DataFrame with columns: t_start, t_end, duration_sec, excursion_ft.
     """
-    # Required channels
     for col in ["TFLO", "DBTM", "CDEPTH"]:
         if col not in df.columns:
             raise ValueError(f"Missing required column: {col}")
@@ -108,10 +102,8 @@ def detect_activity_segments(
     pump_on = (df["TFLO"] > tflo_thr).fillna(False).to_numpy()
     delta   = (df["DBTM"] - df["CDEPTH"]).to_numpy()
 
-    # condition: ream OR backream
     cond_any = (delta >= ream_ft) | ((-delta) >= back_ft)
 
-    # mask of valid activity (pump on, excursion, and not-NaN)
     valid_db = ~np.isnan(df["DBTM"].to_numpy())
     valid_cd = ~np.isnan(df["CDEPTH"].to_numpy())
     mask = pump_on & cond_any & valid_db & valid_cd
@@ -123,26 +115,23 @@ def detect_activity_segments(
         logger.info("No activity segments detected (mask empty).")
         return pd.DataFrame(segments, columns=["t_start", "t_end", "duration_sec", "excursion_ft"])
 
-    # find contiguous groups in true_idxs
     breaks = np.where(np.diff(true_idxs) > 1)[0]
     group_starts = np.concatenate(([0], breaks + 1))
     group_ends = np.concatenate((breaks, [true_idxs.size - 1]))
 
     for gs, ge in zip(group_starts, group_ends):
         s_idx = int(true_idxs[gs])
-        e_idx = int(true_idxs[ge])  # last index where mask is True in this group
+        e_idx = int(true_idxs[ge])
 
         t0 = pd.to_datetime(df.loc[s_idx, "timestamp"])
         t1 = pd.to_datetime(df.loc[e_idx, "timestamp"])
         dur_sec = (t1 - t0).total_seconds()
         if dur_sec < 0:
-            # defensive: skip if timestamps out-of-order for some reason
             logger.warning("Negative duration encountered for indices %s-%s; skipping.", s_idx, e_idx)
             continue
 
         if dur_sec >= min_sec:
             dsub = delta[s_idx:e_idx + 1]
-            # excursion is max absolute delta
             excursion_ft = float(np.nanmax(np.abs(dsub)))
             segments.append({
                 "t_start": t0,
@@ -158,11 +147,10 @@ def detect_activity_segments(
     return seg_df
 
 # ----------------------------
-# Matplotlib plots
+# Matplotlib plots (unchanged)
 # ----------------------------
 def plot_overview_with_blue_strips(df: pd.DataFrame, seg_df: pd.DataFrame,
                                    out_png: Path, color: str, alpha: float) -> Path:
-    """5‑panel overview (TFLO, SPPA, ECD, ROP5, BPOS) with blue strips on BPOS & TFLO."""
     plt.style.use("seaborn-v0_8")
     fig, axs = plt.subplots(5, 1, figsize=(14, 12), sharex=True)
 
@@ -185,7 +173,6 @@ def plot_overview_with_blue_strips(df: pd.DataFrame, seg_df: pd.DataFrame,
     axs[-1].set_xlabel("Date & Time")
 
     if not seg_df.empty:
-        # determine a y-position for annotations if BPOS exists; fallback to 0.99 in paper coords
         if "BPOS" in df.columns and df["BPOS"].notna().any():
             ymax = float(df["BPOS"].max(skipna=True))
             text_coord_y = ymax * 0.995
@@ -199,13 +186,11 @@ def plot_overview_with_blue_strips(df: pd.DataFrame, seg_df: pd.DataFrame,
                 ax.axvspan(pd.to_datetime(s["t_start"]),
                            pd.to_datetime(s["t_end"]),
                            color=color, alpha=alpha)
-            # annotation
             if use_data_coords:
                 axs[4].text(pd.to_datetime(s["t_start"]), text_coord_y,
                             f"{int(s['duration_sec'])}s\n±{s['excursion_ft']:.0f} ft",
                             fontsize=7, color=color, rotation=90, va="top")
             else:
-                # place in axes fraction coordinates
                 axs[4].annotate(f"{int(s['duration_sec'])}s\n±{s['excursion_ft']:.0f} ft",
                                 xy=(pd.to_datetime(s["t_start"]), 0.99),
                                 xycoords=("data", "axes fraction"),
@@ -226,7 +211,6 @@ def plot_overview_with_blue_strips(df: pd.DataFrame, seg_df: pd.DataFrame,
 
 def plot_bpos_strip_blue(df: pd.DataFrame, seg_df: pd.DataFrame,
                          out_png: Path, color: str, alpha: float) -> Path:
-    """Compact BPOS strip with blue shading and date+time axis."""
     plt.style.use("seaborn-v0_8")
     fig, ax = plt.subplots(1, 1, figsize=(14, 4))
 
@@ -280,78 +264,90 @@ def export_plotly_html_offline(df: pd.DataFrame, seg_df: pd.DataFrame,
     """
     Create a fully self-contained HTML (Plotly JS inlined) for offline use.
 
-    Layout:
-      Row 1: TFLO (primary Y) and SPPA (secondary Y)
-      Row 2: BPOS (single axis)
+    Layout requested:
+      Row 1: BPOS (primary Y) and DBTM (overlay on primary Y)
+      Row 2: TFLO (primary Y) and SPPA (secondary Y)
       Row 3: RPM (primary Y) and TQA (secondary Y)
 
-    Missing columns are handled gracefully (an empty trace is added so layout/legend remains consistent).
-    Blue activity strips are drawn across the full figure (yref='paper').
+    All y-axes are interactive (fixedrange=False) and autorange=True so the user can dynamically adjust the Y scale.
     """
-    # Prepare subplot layout with secondary y for rows 1 and 3
+    # Helper for fallback column names
+    def first_existing_column(df, candidates):
+        for c in candidates:
+            if c in df.columns:
+                return c
+        return None
+
+    # map RPM and TQA column names with fallbacks
+    rpm_col = first_existing_column(df, ["RPM", "TVDE"])
+    tqa_col = first_existing_column(df, ["TQA", "TRQ"])
+
+    # Prepare subplot layout with secondary y for rows 2 and 3 (row1 primary only)
     fig = make_subplots(
         rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.04,
         specs=[
-            [{"secondary_y": True}],
-            [{"secondary_y": False}],
-            [{"secondary_y": True}]
+            [{"secondary_y": False}],  # Row1: BPOS primary + DBTM on same axis
+            [{"secondary_y": True}],   # Row2: TFLO primary, SPPA secondary
+            [{"secondary_y": True}]    # Row3: RPM primary, TQA secondary
         ],
-        row_heights=[0.3, 0.4, 0.3],
+        row_heights=[0.35, 0.30, 0.35],
     )
 
-    # Helper to safe-get series or empty
     def series_or_empty(name):
-        if name in df.columns and df[name].notna().any():
+        if name and name in df.columns and df[name].notna().any():
             return df["timestamp"], df[name]
         else:
             return [], []
 
-    # Row 1: TFLO (primary) and SPPA (secondary)
+    # Row 1: BPOS primary and DBTM overlay on the same axis
+    x_bpos, y_bpos = series_or_empty("BPOS")
+    x_dbtm, y_dbtm = series_or_empty("DBTM")
+
+    fig.add_trace(go.Scatter(
+        x=x_bpos, y=y_bpos, mode="lines", name="BPOS (ft)",
+        line=dict(color="black", width=1),
+        hovertemplate="%{x}<br>BPOS: %{y:.2f} ft<extra></extra>"
+    ), row=1, col=1, secondary_y=False)
+
+    fig.add_trace(go.Scatter(
+        x=x_dbtm, y=y_dbtm, mode="lines", name="DBTM (ft)",
+        line=dict(color="green", width=1, dash="dot"),
+        hovertemplate="%{x}<br>DBTM: %{y:.2f} ft<extra></extra>"
+    ), row=1, col=1, secondary_y=False)
+
+    # Row 2: TFLO primary, SPPA secondary
     x_tflo, y_tflo = series_or_empty("TFLO")
     x_sppa, y_sppa = series_or_empty("SPPA")
 
     fig.add_trace(go.Scatter(
-        x=x_tflo, y=y_tflo,
-        mode="lines", name="TFLO (gpm)",
+        x=x_tflo, y=y_tflo, mode="lines", name="TFLO (gpm)",
         line=dict(color="teal", width=1),
         hovertemplate="%{x}<br>TFLO: %{y:.2f} gpm<extra></extra>"
-    ), row=1, col=1, secondary_y=False)
+    ), row=2, col=1, secondary_y=False)
 
     fig.add_trace(go.Scatter(
-        x=x_sppa, y=y_sppa,
-        mode="lines", name="SPPA (psi)",
-        line=dict(color="crimson", width=1),
+        x=x_sppa, y=y_sppa, mode="lines", name="SPPA (psi)",
+        line=dict(color="crimson", width=1, dash="dot"),
         hovertemplate="%{x}<br>SPPA: %{y:.2f} psi<extra></extra>"
-    ), row=1, col=1, secondary_y=True)
+    ), row=2, col=1, secondary_y=True)
 
-    # Row 2: BPOS
-    x_bpos, y_bpos = series_or_empty("BPOS")
-    fig.add_trace(go.Scatter(
-        x=x_bpos, y=y_bpos,
-        mode="lines", name="BPOS (ft)",
-        line=dict(color="black", width=1),
-        hovertemplate="%{x}<br>BPOS: %{y:.2f} ft<extra></extra>"
-    ), row=2, col=1)
-
-    # Row 3: RPM (primary) and TQA (secondary)
-    x_rpm, y_rpm = series_or_empty("RPM")
-    x_tqa, y_tqa = series_or_empty("TQA")
+    # Row 3: RPM primary, TQA secondary (with fallbacks)
+    x_rpm, y_rpm = series_or_empty(rpm_col)
+    x_tqa, y_tqa = series_or_empty(tqa_col)
 
     fig.add_trace(go.Scatter(
-        x=x_rpm, y=y_rpm,
-        mode="lines", name="RPM",
+        x=x_rpm, y=y_rpm, mode="lines", name=f"{rpm_col or 'RPM'}",
         line=dict(color="navy", width=1),
-        hovertemplate="%{x}<br>RPM: %{y:.2f}<extra></extra>"
+        hovertemplate="%{x}<br>" + (f"{rpm_col}: " if rpm_col else "RPM: ") + "%{y:.2f}<extra></extra>"
     ), row=3, col=1, secondary_y=False)
 
     fig.add_trace(go.Scatter(
-        x=x_tqa, y=y_tqa,
-        mode="lines", name="TQA",
-        line=dict(color="purple", width=1, dash="dot"),
-        hovertemplate="%{x}<br>TQA: %{y:.2f}<extra></extra>"
+        x=x_tqa, y=y_tqa, mode="lines", name=f"{tqa_col or 'TQA'}",
+        line=dict(color="purple", width=1, dash="dash"),
+        hovertemplate="%{x}<br>" + (f"{tqa_col}: " if tqa_col else "TQA: ") + "%{y:.2f}<extra></extra>"
     ), row=3, col=1, secondary_y=True)
 
-    # Blue strips as shapes across the full figure
+    # Blue activity strips as shapes across the full figure (yref='paper')
     for _, s in seg_df.iterrows():
         fig.add_shape(
             type="rect", xref="x", yref="paper",
@@ -359,24 +355,31 @@ def export_plotly_html_offline(df: pd.DataFrame, seg_df: pd.DataFrame,
             y0=0, y1=1, fillcolor=color, opacity=alpha, line=dict(width=0)
         )
 
-    # Axis titles
-    fig.update_yaxes(title_text="TFLO (gpm)", row=1, col=1, secondary_y=False)
-    fig.update_yaxes(title_text="SPPA (psi)", row=1, col=1, secondary_y=True)
-    fig.update_yaxes(title_text="BPOS (ft)", row=2, col=1)
-    fig.update_yaxes(title_text="RPM", row=3, col=1, secondary_y=False)
-    fig.update_yaxes(title_text="TQA", row=3, col=1, secondary_y=True)
+    # Axis titles and interactivity
+    fig.update_yaxes(title_text="BPOS / DBTM (ft)", row=1, col=1,
+                     autorange=True, fixedrange=False)
+
+    fig.update_yaxes(title_text="TFLO (gpm)", row=2, col=1, secondary_y=False,
+                     autorange=True, fixedrange=False)
+    fig.update_yaxes(title_text="SPPA (psi)", row=2, col=1, secondary_y=True,
+                     autorange=True, fixedrange=False)
+
+    fig.update_yaxes(title_text=f"{rpm_col or 'RPM'}", row=3, col=1, secondary_y=False,
+                     autorange=True, fixedrange=False)
+    fig.update_yaxes(title_text=f"{tqa_col or 'TQA'}", row=3, col=1, secondary_y=True,
+                     autorange=True, fixedrange=False)
 
     fig.update_layout(
-        title="Activity (Ream+Backream) — TFLO/SPPA | BPOS | RPM/TQA (Offline)",
+        title="Activity (Ream+Backream) — BPOS/DBTM | TFLO+SPPA | RPM+TQA (Offline)",
         xaxis=dict(title="Date & Time", type="date"),
         xaxis2=dict(title="Date & Time", type="date"),
         xaxis3=dict(title="Date & Time", type="date"),
-        margin=dict(l=60, r=20, t=60, b=60),
+        margin=dict(l=70, r=20, t=70, b=60),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
         hovermode="x unified",
     )
 
-    # Range selector / slider applied to xaxis (the bottom-most xaxis is xaxis3 by default; use shared_xaxes)
+    # Range selector / slider applied to the bottom-most xaxis (xaxis3)
     fig.update_layout(
         xaxis3=dict(
             rangeslider=dict(visible=True),
@@ -389,19 +392,19 @@ def export_plotly_html_offline(df: pd.DataFrame, seg_df: pd.DataFrame,
         )
     )
 
-    # Inline Plotly JS
+    # Export self-contained HTML
     fig.write_html(str(out_html), include_plotlyjs="inline", full_html=True)
     logger.info("Saved offline interactive HTML → %s", out_html)
     return out_html
 
 # ----------------------------
-# CLI
+# CLI & main
 # ----------------------------
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Combined Ream+Backream detection (blue strips) on BPOS, OFFLINE HTML."
+        description="Combined Ream+Backream detection (BPOS/DBTM | TFLO/SPPA | RPM/TQA) and OFFLINE HTML."
     )
-    p.add_argument("--excel", required=True, help="Path to the Excel/CSV historian (.xlsx/.csv)")
+    p.add_argument("--excel", required=True, help="Path to the Excel/CSV historian (e.g. \"time_12.25 inch HS.xlsx\")")
     p.add_argument("--outdir", default="site", help="Output directory (default: ./site)")
     p.add_argument("--tflo", type=float, default=DEFAULT_TFLO_ON_THRESHOLD, help="Pump ON threshold (gpm)")
     p.add_argument("--minsec", type=int, default=DEFAULT_MIN_ACTIVITY_SECONDS, help="Minimum segment duration (sec)")
